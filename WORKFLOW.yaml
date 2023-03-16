@@ -1,0 +1,176 @@
+description:
+        name: B_CalculateLabels
+        description: |
+                The procedure for calculating COSMO saturation vapor pressures for a
+                large amount of molecules. From set-up to collection of all of them.
+
+env:
+        variables:
+                OUTPUT_PATH: ./Dir_Out
+                # Then Copy all the scripts into the workflow in case the originals are changed
+                SCRIPTS: $(MERLIN_INFO)/Scripts
+                # Potential variables: Directories for saving / error handling / archiving?
+                BATCH_MOL: KillTheBias_3
+
+merlin:
+        # This is where I feed all the different molecules to be calculated
+        samples:
+                generate:
+                        cmd: |
+                                cp -r Scripts $(MERLIN_INFO)/
+                                # B0: Create samples (csv with index, SMILES and nhb) input is a npz. file containing ['prediction_idxs']
+                                python3 $(SCRIPTS)/B0_CREATE_SAMPLES.py $(SPECROOT)/Indices/$(BATCH_MOL).npz $(SCRIPTS)/ $(SPECROOT)/
+                file: $(SCRIPTS)/$(BATCH_MOL).csv
+                # All sample properties I provide: Index, SMILES, Number of hydrogenbond donors
+                column_labels: [IND, SMILES, NHB]
+                # Not sure how the following parameter works
+                level_max_dirs: 100
+
+        # Define the task server configuration and workers to run the tasks.
+        resources:
+                task_server: celery
+                # Customize workers, I could introduce "heavy_COSMO_workers" that send timeout jobs with more threads
+                workers:
+                        serialworkers:
+                                # --concurrency sets number of threads to use on each node of the HPC 
+                                # allocation. A good choice for this is the number of simulations that
+                                # can be run per node.
+                                args: -l DEBUG --concurrency 32 --prefetch-multiplier 1 -O fair
+                                steps: [B1_COSMO_PREP, B7-11_COSMOtherm, B12_DataCollection_single] # which step should this worker be used in
+                                nodes: 8
+                        cosmoworkers:
+                                args: -l DEBUG --concurrency 2 --prefetch-multiplier 1 -O fair
+                                steps: [B3-B4_COSMOCONF]
+                                nodes: 136
+                        turboworkers:
+                                args: -l INFO --concurrency 4 --prefetch-multiplier 1 -O fair
+                                steps: [B5-B6_TURBOMOLE]
+                                nodes: 16
+                                #machines:
+                                
+batch:
+        type: local 
+        bank: project_2003838
+        launch_args: -c 128  #--mpi=pmi2
+        nodes: 160
+        walltime: 2160 
+        
+study:
+        - name: B1_COSMO_PREP
+          description: |
+                        Creates a .sdf file for a given molecule and writes the number of 
+                        hydrogen bond donors to a file (latter may be unnecessary)
+          run:
+                cmd: |
+                        python3 $(SCRIPTS)/B1_COSMO_PREPARATION.py $(IND) '$(SMILES)' $(NHB)
+                task_queue: serialworkers
+                procs: 1
+                cores per task: 4
+
+        - name: B3-B4_COSMOCONF 
+          description: |
+                        COSMOconf finds and optimizes all conformers of the molecules. Then there
+                        are some bash operations
+          run: 
+                cmd: |
+                        echo "B3-B4 starts at $(date)"
+                        # First change to directory! Remember copying/keeping all needed files, even when splitting, maybe zip them
+                        cd $(B1_COSMO_PREP.workspace)/$(MERLIN_SAMPLE_PATH)
+                        mkdir WRKDIR
+                        mv *.sdf WRKDIR
+                        cd WRKDIR
+                        wrkdir_B3=`pwd`
+                        # Adjustments to comply with Nooras COSMO workflow
+                        folder=$(pwd) >> $wrkdir_B3/MY_B3-B4_COSMOCONF.out
+                        ls *.sdf > mylist
+                        # Keep some basic info
+                        unq_name=`echo $(MERLIN_SAMPLE_PATH)_$(IND) | tr / _`
+                        echo $unq_name >> $wrkdir_B3/MY_B3-B4_COSMOCONF.out
+                        echo "ID $(MERLIN_SAMPLE_ID)"
+                        # Run COSMOconf
+                        ml .merlin/1.7.5
+                        $(LAUNCHER) $(SCRIPTS)/B3-B4_COSMOCONF.sh $unq_name $wrkdir_B3 $(IND) >> $wrkdir_B3/MY_B3-B4_COSMOCONF.out 2>&1 
+                      
+                shell: /usr/bin/bash
+                depends: [B1_COSMO_PREP]
+                task_queue: cosmoworkers
+                procs: 1
+                cores per task: 64
+        - name: B5-B6_TURBOMOLE
+          description: Calculate Gasphase conformers for all conformers with Turbomole
+          run:
+                cmd: |
+                        echo "Start B5-B6_TURBOMOLE"
+                        # Change to directory! Remember copying/keeping all needed files, even when splitting, maybe zip them
+                        cd $(B1_COSMO_PREP.workspace)/$(MERLIN_SAMPLE_PATH)
+                        cd WRKDIR
+                        wrkdir_turbo=`pwd`
+                        echo $wrkdir_turbo
+                        unq_name=`echo $(MERLIN_SAMPLE_PATH)_$(IND) | tr / _`
+
+                        $(LAUNCHER) $(SCRIPTS)/B5-B6_TURBOMOLE.sh $unq_name $wrkdir_turbo  >> $wrkdir_turbo/MY_B5-B6_TURBO.out 2>&1
+                depends: [B3-B4_COSMOCONF]
+                task_queue: turboworkers
+                procs: 1
+                cores per task: 32
+        - name: B7-11_COSMOtherm
+          description: Choose conformers and Calculate the saturation vapor pressure
+          run:
+                cmd: |
+                        echo "B7-11_COSMOtherm.py will calculate labels"
+                        cd $(B1_COSMO_PREP.workspace)/$(MERLIN_SAMPLE_PATH)/WRKDIR
+                        cp EnergyfilesBP-TZVPD-FINE-COSMO-SP/* Results_of_BP-TZVPD-FINE-COSMO/
+                        cd Results_of_BP-TZVPD-FINE-COSMO/
+                        python3 $(SCRIPTS)/B7-11_COSMOtherm.py $(SCRIPTS)/ >> MY_B7-11_output.out 2>&1
+                        mv MY_B7-11_output.out .. 
+                depends: [B5-B6_TURBOMOLE]
+                task_queue: serialworkers
+                procs: 1
+                cores per task: 4
+        - name: B12_DataCollection_single
+          description: Collect data for each single molecule in a corresponding file and zip the WRKDIR after
+          run:
+                cmd: |
+                        echo "B12_collection_single will collect data"
+                        # Change to workdirectory
+                        cd $(B1_COSMO_PREP.workspace)/$(MERLIN_SAMPLE_PATH)/WRKDIR/Results_of_BP-TZVPD-FINE-COSMO/
+                        # Grep pSat + IND, NumOfConf, NumOfConfUsed, intraNHB in 'COLLECTED_DATA_IDX.txt'
+                        $(SCRIPTS)/B12_COLLECT_single.sh
+                        
+                        # Archive the WRKDIR
+                        cd ../../
+                        cat WRKDIR/MY* >> COSMO.out
+                        # RM the zips with the CONF and TURBO calculation if they exist
+                        rm -f *.zip
+                        # zip only if there are no NAN !
+                        pSat=`awk 'BEGIN { FS = "," } ; { print $2 }' COLLECTED_DATA_$(IND).txt`
+
+                        if [[ pSat != *"NaN"* ]]; then
+                                zip -r "WRKDIR"_$(IND).zip WRKDIR
+                                rm -R WRKDIR 
+                        fi
+
+                depends: [B7-11_COSMOtherm]
+                task_queue: serialworkers
+                procs: 1
+                cores per task: 4
+        - name: B12_DataCollection_all
+          description: Collect data of ALL molecules and add them to datapool
+          run:
+                cmd: |
+                        echo "B12_collection_all will collect data and add it to the data pool"
+                        echo "IDX,pSat_mbar,intraNHB,NumOfConf,NumOfConfUsed,ChemPot_kcalmol,FreeEnergy_kcalmol,HeatOfVap_kcalmol" > $(WORKSPACE)/COLLECT_ALL.txt                        
+                        
+                        for path in $(MERLIN_PATHS_ALL)
+                        do
+                            echo $path
+                            cat $(B1_COSMO_PREP.workspace)/$path/COLLECTED_DATA_*.txt >> $(WORKSPACE)/COLLECT_ALL.txt
+                        done
+
+                        python3 $(SCRIPTS)/B12_COLLECT.py $(WORKSPACE)/COLLECT_ALL.txt $(SPECROOT)/
+        
+                depends: [B12_DataCollection_single_*]
+                task_queue: serialworkers
+                procs: 1
+                cores per task: 4
+
